@@ -43,7 +43,7 @@ with st.expander("Input Parameters", expanded=True):
         f"main={MAIN_INFLOW_MAX} veh/hr, on-ramp={ONRAMP_INFLOW_MAX} veh/hr"
     )
 
-    T_hours = st.slider("Simulation time (hr)", min_value=1.0, max_value=9.0, value=6.0, step=0.5)
+    T_hours = st.slider("Simulation time (hr)", min_value=1.0, max_value=24.0, value=6.0, step=0.5)
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
@@ -167,6 +167,58 @@ def make_line_plot(time, series_dict, title, ylabel):
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
+    return fig
+
+
+def compute_network_weighted_series(res):
+    n_main = res["n_main"][:-1]
+    speed_main = res["speed_main"]
+    time = res["time"]
+    total_veh = np.sum(n_main, axis=1)
+
+    weighted_speed = np.divide(
+        np.sum(speed_main * n_main, axis=1),
+        total_veh,
+        out=np.full_like(total_veh, VF, dtype=float),
+        where=total_veh > 1e-9,
+    )
+
+    network_length_km = speed_main.shape[1] * ctm_core.DX
+    network_density = total_veh / max(1e-9, network_length_km)
+    network_flow = network_density * weighted_speed
+
+    return {
+        "time": time,
+        "speed": weighted_speed,
+        "density": network_density,
+        "flow": network_flow,
+    }
+
+
+def make_network_qk_grid(network_series_by_case):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    axes_flat = axes.ravel()
+
+    for ax, (label, series) in zip(axes_flat, network_series_by_case.items()):
+        k = series["density"]
+        q = series["flow"]
+        t = series["time"]
+
+        ax.plot(k, q, color="#2d3748", linewidth=0.9, alpha=0.55)
+        sc = ax.scatter(k, q, c=t, cmap="viridis", s=20, alpha=0.9)
+
+        ax.set_title(label)
+        ax.set_xlabel("Network density k (veh/km)")
+        ax.set_ylabel("Network flow q (veh/hr)")
+        ax.set_xlim(0.0, 4.0 * KJ_PER_LANE)
+        ax.set_ylim(0.0, 4.0 * QMAX_PER_LANE)
+        ax.grid(True, alpha=0.25)
+
+        cbar = fig.colorbar(sc, ax=ax)
+        cbar.set_label("Time (hr)")
+
+    fig.suptitle("Network-level q-k diagram by timestep (4 scenarios)")
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
     return fig
 
 
@@ -298,7 +350,7 @@ def make_network_image_with_incident(image_path, n_main_cells, incident_cell):
     ax.text(
         x0,
         y_center - 0.05,
-        f"Incident cell: {incident_cell}",
+        f"Incident cell",
         color="yellow",
         fontsize=10,
         fontweight="bold",
@@ -411,7 +463,7 @@ def make_trajectory_speed_background_grid(results_by_case, trajectories_by_case,
 layout_left, layout_right = st.columns([2.4, 1.0])
 
 with layout_left:
-    st.subheader("Network")
+    st.subheader("Initial Network")
     st.pyplot(make_network_image_with_incident(str(BASE_DIR / "Network_image.png"), n_main_cells, incident_cell))
     st.caption(f"Incident marker: cell {incident_cell}, from {incident_start_hour:.2f} hr to {incident_start_hour + incident_duration_hour:.2f} hr")
 
@@ -489,12 +541,13 @@ if run_clicked:
             f"- Vehicle start time: {vehicle_start_hour:.2f} h"
         )
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "Density (2x2)",
             "Speed (2x2)",
             "Flow comparison",
             "Speed/Density comparison",
             "Trajectory & Delay",
+            "Network q-k diagram",
         ])
 
         with tab1:
@@ -545,19 +598,24 @@ if run_clicked:
             st.pyplot(fig_flow)
 
         with tab4:
+            network_series_by_case = {
+                label: compute_network_weighted_series(res)
+                for label, res in results_by_case.items()
+            }
+
             fig_speed_ts = make_line_plot(
                 next(iter(results_by_case.values()))["time"],
-                {label: np.mean(res["speed_main"], axis=1) for label, res in results_by_case.items()},
-                "Mean mainline speed comparison",
+                {label: series["speed"] for label, series in network_series_by_case.items()},
+                "Vehicle-weighted network speed comparison",
                 "Speed (km/hr)",
             )
             st.pyplot(fig_speed_ts)
 
             fig_density_ts = make_line_plot(
                 next(iter(results_by_case.values()))["time"],
-                {label: np.mean(res["density_main"], axis=1) for label, res in results_by_case.items()},
-                "Mean mainline density comparison",
-                "Density (veh/km/lane)",
+                {label: series["density"] for label, series in network_series_by_case.items()},
+                "Network density comparison (total vehicles / network length)",
+                "Density (veh/km)",
             )
             st.pyplot(fig_density_ts)
 
@@ -577,6 +635,9 @@ if run_clicked:
                     }
                 )
             st.dataframe(delay_rows, use_container_width=True)
+
+        with tab6:
+            st.pyplot(make_network_qk_grid(network_series_by_case))
 
         with st.expander("Simulation arrays preview (Peak / Incident)"):
             preview = results_by_case["Peak / Incident"]
