@@ -98,7 +98,7 @@ with st.expander("Input Parameters", expanded=True):
         )
 
     with col2:
-        st.subheader("Network & Merge")
+        st.subheader("Merge / Diverge Ratio")
         beta_off = st.slider(
             "Off-ramp split ratio β",
             min_value=0.00,
@@ -110,6 +110,9 @@ with st.expander("Input Parameters", expanded=True):
         p_main = st.slider("Mainline priority", min_value=0.0, max_value=1.0, value=float(OFF_PEAK_DEFAULT["p_main"]), step=0.05)
         p_on = round(1.0 - p_main, 2)
         st.write(f"On-ramp priority: **{p_on:.2f}**")
+
+    with col3:
+        st.subheader("Network Structure & Initial State")
 
         n_main_cells = st.slider("Mainline cells", min_value=8, max_value=30, value=int(N_MAIN_DEFAULT), step=1)
 
@@ -144,7 +147,7 @@ with st.expander("Input Parameters", expanded=True):
 
         initial_main_density = st.slider("Initial mainline density (veh/km/lane)", min_value=0.0, max_value=100.0, value=10.0, step=5.0)
 
-    with col3:
+    with col4:
         st.subheader("Incident")
         incident_cell = st.slider("Incident cell", min_value=0, max_value=n_main_cells - 1, value=min(6, n_main_cells - 1), step=1)
         incident_start_hour = st.slider("Incident start time (hr)", min_value=0.0, max_value=T_hours, value=min(1.0, T_hours), step=DT)
@@ -152,11 +155,7 @@ with st.expander("Input Parameters", expanded=True):
         incident_duration_hour = st.slider("Incident duration (hr)", min_value=DT, max_value=max_duration, value=min(1.0, max_duration), step=DT)
         blocked_lanes = st.slider("Blocked lanes", min_value=1, max_value=3, value=1, step=1)
 
-    with col4:
-        st.subheader("Trajectory")
-        vehicle_start_hour = st.slider("Vehicle start time from mainline origin (hr)", min_value=0.0, max_value=T_hours, value=1.0, step=DT)
-
-run_clicked = st.button("Run 4-case comparison", type="primary", use_container_width=True)
+run_clicked = st.button("Run 4-case comparison", type="primary", width="stretch")
 
 # ---------------------------------------------------------
 # Helpers
@@ -215,6 +214,236 @@ def make_detector_flow_by_scenario_grid(results_by_case, middle_detector_cell_id
     fig.suptitle("Detector flow comparison by scenario")
     fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
     return fig
+
+
+def make_three_lane_cumulative_curve_grid(results_by_case, background_flow_by_case=None):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    axes_flat = axes.ravel()
+
+    for ax, (scenario_label, res) in zip(axes_flat, results_by_case.items()):
+        time = res["time"]
+        lanes = res["main_lanes_by_cell"]
+        f_link = res["f_main_link"]
+        n_cells = len(lanes)
+
+        lane3_cells = np.where(np.isclose(lanes, 3.0))[0]
+        if lane3_cells.size == 0:
+            ax.text(0.5, 0.5, "No 3-lane cells in this scenario", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(scenario_label)
+            ax.set_xlabel("Time (hr)")
+            ax.set_ylabel("Cumulative count (veh)")
+            ax.grid(True, alpha=0.3)
+            continue
+
+        upstream_boundary_links = [
+            i - 1 for i in lane3_cells
+            if i > 0 and (not np.isclose(lanes[i - 1], 3.0))
+        ]
+        downstream_boundary_links = [
+            i for i in lane3_cells
+            if i < n_cells - 1 and (not np.isclose(lanes[i + 1], 3.0))
+        ]
+
+        q_up = np.zeros_like(time, dtype=float)
+        q_down = np.zeros_like(time, dtype=float)
+        if len(upstream_boundary_links) > 0:
+            q_up = np.sum(f_link[:, upstream_boundary_links], axis=1)
+        if len(downstream_boundary_links) > 0:
+            q_down = np.sum(f_link[:, downstream_boundary_links], axis=1)
+
+        # Use edge-aligned cumulative counts so curves start at exactly 0 at t=t0.
+        t_edge = np.concatenate(([float(time[0])], time + DT))
+        n_up = np.concatenate(([0.0], np.cumsum(q_up * DT)))
+        n_down = np.concatenate(([0.0], np.cumsum(q_down * DT)))
+
+        # Detector-specific time alignment:
+        # subtract free-flow travel time from mainline origin to each detector.
+        up_det_link = int(min(upstream_boundary_links)) if len(upstream_boundary_links) > 0 else 0
+        down_det_link = int(max(downstream_boundary_links)) if len(downstream_boundary_links) > 0 else max(0, n_cells - 2)
+        t_up_shift_ff = ((up_det_link + 1) * ctm_core.DX) / max(VF, 1e-9)
+        t_down_shift_ff = ((down_det_link + 1) * ctm_core.DX) / max(VF, 1e-9)
+
+        t_up_edge = t_edge - t_up_shift_ff
+        t_down_edge = t_edge - t_down_shift_ff
+
+        # Determine background flow q0.
+        if background_flow_by_case is not None and scenario_label in background_flow_by_case:
+            q0 = float(background_flow_by_case[scenario_label])
+        else:
+            n_ref_steps = max(3, int(0.15 * len(time)))
+            q0 = float(np.mean(q_up[:n_ref_steps])) if len(time) > 0 else 0.0
+
+        # Fixed detector-based t0 logic (user-requested):
+        # upstream t0 step = upstream detector link index + 2
+        # downstream t0 step = downstream detector link index + 2
+        # Example with diverge_idx=1 and merge_idx=9:
+        # up_link=1 -> t0 step=3, down_link=8 -> t0 step=10.
+        i0_up = int(up_det_link + 2)
+        i0_down = int(down_det_link + 2)
+        i0_up = max(0, min(i0_up, len(t_up_edge) - 1))
+        i0_down = max(0, min(i0_down, len(t_down_edge) - 1))
+
+        t0_up = float(t_up_edge[i0_up])
+        t0_down = float(t_down_edge[i0_down])
+
+        tau_up_plot = t_up_edge[i0_up:] - t0_up
+        tau_down_plot = t_down_edge[i0_down:] - t0_down
+
+        n_up_reacc = n_up[i0_up:] - float(n_up[i0_up])
+        n_down_reacc = n_down[i0_down:] - float(n_down[i0_down])
+
+        n_up_plot = n_up_reacc - q0 * tau_up_plot
+        n_down_plot = n_down_reacc - q0 * tau_down_plot
+
+        # Keep plotting from shifted origin only.
+        keep_up = tau_up_plot >= 0.0
+        keep_down = tau_down_plot >= 0.0
+        tau_up_plot = tau_up_plot[keep_up]
+        tau_down_plot = tau_down_plot[keep_down]
+        n_up_plot = n_up_plot[keep_up]
+        n_down_plot = n_down_plot[keep_down]
+
+        if tau_up_plot.size == 0 or tau_up_plot[0] > 1e-12:
+            tau_up_plot = np.insert(tau_up_plot, 0, 0.0)
+            n_up_plot = np.insert(n_up_plot, 0, 0.0)
+        if tau_down_plot.size == 0 or tau_down_plot[0] > 1e-12:
+            tau_down_plot = np.insert(tau_down_plot, 0, 0.0)
+            n_down_plot = np.insert(n_down_plot, 0, 0.0)
+
+        ax.plot(tau_up_plot, n_up_plot, color="#1f77b4", linewidth=2.0, label="Upstream Newell curve")
+        ax.plot(tau_down_plot, n_down_plot, color="#d62728", linewidth=2.0, label="Downstream Newell curve")
+        ax.axhline(0.0, color="#808080", linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.axvline(0.0, color="#808080", linewidth=0.8, linestyle="--", alpha=0.6)
+
+        ax.set_title(scenario_label)
+        ax.set_xlabel("Shifted time from origin (hr)")
+        ax.set_ylabel("N(t)-q0(t-t0) (veh)")
+        ax.set_xlim(left=0.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(
+            title=(
+                f"q0={q0:.0f} veh/hr\n"
+                f"t_up shift={t_up_shift_ff:.2f} hr\n"
+                f"t_down shift={t_down_shift_ff:.2f} hr"
+            ),
+            loc="lower left",
+            fontsize=8,
+            framealpha=0.9,
+        )
+    fig.suptitle("3-lane cells: Newell N-curve from detector-based t0 timestep")
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
+    return fig
+
+
+def _inverse_cumulative_time(cumulative_count, time_axis_end, targets):
+    cum = np.maximum.accumulate(np.asarray(cumulative_count, dtype=float))
+    t = np.asarray(time_axis_end, dtype=float)
+    if cum.size == 0:
+        return np.zeros_like(targets, dtype=float)
+
+    keep = np.r_[True, np.diff(cum) > 1e-9]
+    x = cum[keep]
+    y = t[keep]
+    if x.size == 1:
+        return np.full_like(targets, y[0], dtype=float)
+
+    return np.interp(targets, x, y, left=y[0], right=y[-1])
+
+
+def compute_three_lane_segment_total_delay_veh_hr(res):
+    time = res["time"]
+    lanes = res["main_lanes_by_cell"]
+    f_link = res["f_main_link"]
+    n_cells = len(lanes)
+
+    lane3_cells = np.where(np.isclose(lanes, 3.0))[0]
+    if lane3_cells.size == 0 or len(time) == 0:
+        return 0.0, 0, 0, 0
+
+    # Split possibly disconnected 3-lane cells into contiguous segments.
+    segments = []
+    seg_start = int(lane3_cells[0])
+    seg_prev = int(lane3_cells[0])
+    for c in lane3_cells[1:]:
+        c = int(c)
+        if c == seg_prev + 1:
+            seg_prev = c
+            continue
+        segments.append((seg_start, seg_prev))
+        seg_start = c
+        seg_prev = c
+    segments.append((seg_start, seg_prev))
+
+    total_delay_veh_hr = 0.0
+    n_up_total = 0
+    n_down_total = 0
+    n_unmatched = 0
+
+    # Approximate delay from vertical gap with the same alignment logic used in plots:
+    # 1) detector-specific free-flow travel-time shift,
+    # 2) detector-based fixed t0 timestep (link index + 2),
+    # 3) sum_t max(0, N_up - N_down) * DT.
+    for seg_start, seg_end in segments:
+        up_link = seg_start - 1
+        down_link = seg_end
+
+        # Use only main->main boundary links.
+        if up_link < 0 or down_link >= (n_cells - 1):
+            continue
+
+        q_up = f_link[:, up_link]
+        q_down = f_link[:, down_link]
+
+        n_ref_steps = max(3, int(0.15 * len(time)))
+        q0 = float(np.mean(q_up[:n_ref_steps])) if len(time) > 0 else 0.0
+
+        n_up = np.concatenate(([0.0], np.cumsum(q_up * DT)))
+        n_down = np.concatenate(([0.0], np.cumsum(q_down * DT)))
+        t_edge = np.concatenate(([float(time[0])], time + DT))
+        seg_up_total = int(np.floor(n_up[-1] + 1e-9))
+        seg_down_total = int(np.floor(n_down[-1] + 1e-9))
+
+        n_up_total += seg_up_total
+        n_down_total += seg_down_total
+
+        if seg_up_total <= 0:
+            continue
+
+        t_up_shift_ff = ((up_link + 1) * ctm_core.DX) / max(VF, 1e-9)
+        t_down_shift_ff = ((down_link + 1) * ctm_core.DX) / max(VF, 1e-9)
+        t_up_edge = t_edge - t_up_shift_ff
+        t_down_edge = t_edge - t_down_shift_ff
+
+        i0_up = int(up_link + 2)
+        i0_down = int(down_link + 2)
+        i0_up = max(0, min(i0_up, len(t_up_edge) - 1))
+        i0_down = max(0, min(i0_down, len(t_down_edge) - 1))
+
+        t0_up = float(t_up_edge[i0_up])
+        t0_down = float(t_down_edge[i0_down])
+
+        tau_up = t_up_edge[i0_up:] - t0_up
+        tau_down = t_down_edge[i0_down:] - t0_down
+
+        n_up_reacc = n_up[i0_up:] - float(n_up[i0_up])
+        n_down_reacc = n_down[i0_down:] - float(n_down[i0_down])
+
+        n_up_shift = n_up_reacc - q0 * tau_up
+        n_down_shift = n_down_reacc - q0 * tau_down
+
+        tau_end = float(min(np.max(tau_up), np.max(tau_down)))
+        if tau_end <= 0.0:
+            continue
+
+        tau_grid = np.arange(0.0, tau_end + 1e-12, DT)
+        n_up_grid = np.interp(tau_grid, tau_up, n_up_shift, left=n_up_shift[0], right=n_up_shift[-1])
+        n_down_grid = np.interp(tau_grid, tau_down, n_down_shift, left=n_down_shift[0], right=n_down_shift[-1])
+
+        vertical_gap = np.maximum(0.0, n_up_grid - n_down_grid)
+        total_delay_veh_hr += float(np.sum(vertical_gap) * DT)
+        n_unmatched += int(max(0, seg_up_total - seg_down_total))
+
+    return total_delay_veh_hr, n_up_total, n_down_total, n_unmatched
 
 
 def format_hr_m(hours):
@@ -457,7 +686,7 @@ def make_case_heatmap_grid(
             cbar.set_label(cbar_label)
 
     fig.suptitle(title)
-    fig.tight_layout(rect=[0.0, 0.0, 0.88, 0.95])
+    fig.subplots_adjust(left=0.07, bottom=0.08, top=0.90, right=0.88, wspace=0.18, hspace=0.28)
     return fig
 
 
@@ -599,12 +828,34 @@ def make_trajectory_speed_background_grid(results_by_case, trajectories_by_case,
         )
 
         traj = trajectories_by_case[label]
-        ax.plot(traj["time_hr"], traj["distance_km"], color="black", linewidth=1.8, label="Vehicle trajectory")
+        traj_time = np.asarray(traj["time_hr"], dtype=float)
+        traj_dist = np.asarray(traj["distance_km"], dtype=float)
+
+        # Clip trajectory at simulation end time.
+        keep_mask = traj_time <= time_end
+        plot_time = traj_time[keep_mask]
+        plot_dist = traj_dist[keep_mask]
+        if np.any(traj_time > time_end) and len(plot_time) > 0 and plot_time[-1] < time_end:
+            next_idx = int(np.argmax(traj_time > time_end))
+            t0, t1 = traj_time[next_idx - 1], traj_time[next_idx]
+            d0, d1 = traj_dist[next_idx - 1], traj_dist[next_idx]
+            if t1 > t0:
+                ratio = (time_end - t0) / (t1 - t0)
+                d_end = d0 + ratio * (d1 - d0)
+                plot_time = np.append(plot_time, time_end)
+                plot_dist = np.append(plot_dist, d_end)
+
+        ax.plot(plot_time, plot_dist, color="black", linewidth=1.8, label="Vehicle trajectory")
 
         ff_arrival = vehicle_start_hour + traj["free_flow_travel_time_hr"]
+        ff_end_t = min(ff_arrival, time_end)
+        if ff_arrival > vehicle_start_hour:
+            ff_end_x = road_length_km * ((ff_end_t - vehicle_start_hour) / (ff_arrival - vehicle_start_hour))
+        else:
+            ff_end_x = 0.0
         ax.plot(
-            [vehicle_start_hour, ff_arrival],
-            [0.0, road_length_km],
+            [vehicle_start_hour, ff_end_t],
+            [0.0, ff_end_x],
             color="#00c853",
             linestyle="-.",
             linewidth=1.8,
@@ -625,7 +876,7 @@ def make_trajectory_speed_background_grid(results_by_case, trajectories_by_case,
         cbar.set_label("Speed (km/hr)")
 
     fig.suptitle("Trajectory on speed background (4 scenarios)")
-    fig.tight_layout(rect=[0.0, 0.0, 0.88, 0.96])
+    fig.subplots_adjust(left=0.07, bottom=0.08, top=0.92, right=0.88, wspace=0.18, hspace=0.25)
     return fig
 
 
@@ -655,6 +906,41 @@ if merge_top_idx == merge_bottom_idx:
 if merge_top_idx - 1 == diverge_idx or merge_bottom_idx - 1 == diverge_idx:
     st.warning("A merge link overlaps with diverge link. Adjust merge indices.")
 
+with st.expander("CTM Algorithm", expanded=False):
+    st.subheader("CTM Algorithm")
+
+    st.markdown("<h4 style='font-family: Georgia, serif; font-weight: 800;'>Intercell flow</h4>", unsafe_allow_html=True)
+    st.markdown("For sending flow,")
+    st.latex(r"S_i(t) = \min\left(q_{\max,i-1},\; v_f\,k_{i-1}(t)\right)")
+    st.markdown("For receiving flow,")
+    st.latex(r"R_i(t) = \min\left(q_{\max,i},\; w\left[k_j^i-k_i(t)\right]\right)")
+    st.markdown("Inter-cell flow is the minimum of sending flow and receiving flow.")
+    st.latex(r"y_i(t) \leq \min\left\{S_i(t),\; R_i(t)\right\}")
+
+    st.markdown("<h4 style='font-family: Georgia, serif; font-weight: 800;'>Diverging flow</h4>", unsafe_allow_html=True)
+    st.latex(
+        r"""
+\begin{aligned}
+y_{i,\text{main}}(t) &= (1-\beta_{\text{off}})\,S_i(t) \\
+y_{i,\text{off}}(t) &= \beta_{\text{off}}\,S_i(t)
+\end{aligned}
+"""
+    )
+
+    st.markdown("<h4 style='font-family: Georgia, serif; font-weight: 800;'>Merging flow</h4>", unsafe_allow_html=True)
+    st.latex(
+        r"""
+\begin{aligned}
+y_i(t)+y_{on}(t) &= \min\left(S_i(t)+S_{on}(t),\; R_i(t)\right) \\
+y_i(t) &= \min\left(S_i(t),\; p_{\mathrm{main}}R_i(t)\right) \\
+y_{on}(t) &= \min\left(S_{on}(t),\; (1-p_{\mathrm{main}})R_i(t)\right)
+\end{aligned}
+"""
+    )
+
+with st.expander("AI Policy", expanded=False):
+    st.markdown("<h4 style='font-family: Georgia, serif; font-weight: 800;'>Used tool: GPT-5.3-Codex</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='font-family: Georgia, serif; font-weight: 500;'>AI was used for code writing and modification, as well as for web page creation and deployment, but was not used to propose or modify the logic of CTM and analyzation.</h4>", unsafe_allow_html=True)
 # ---------------------------------------------------------
 # Run and display
 # ---------------------------------------------------------
@@ -666,7 +952,10 @@ if run_clicked:
         ("Peak / Incident", float(peak_main_inflow), float(peak_onramp_top_inflow), float(peak_onramp_bottom_inflow), True),
     ]
     incident_case_flags = {label: is_incident for label, _, _, _, is_incident in scenarios}
-
+    background_flow_by_case = {
+        label: float(case_main_inflow) * (1.0 - float(beta_off))
+        for label, case_main_inflow, _, _, _ in scenarios
+    }
     results_by_case = {}
     try:
         for case_label, case_main_inflow, case_on_top, case_on_bottom, case_incident in scenarios:
@@ -696,11 +985,9 @@ if run_clicked:
         st.session_state["ctm_last_run"] = {
             "results_by_case": results_by_case,
             "incident_case_flags": incident_case_flags,
-            "trajectories_by_case": {
-                case_label: compute_vehicle_trajectory(case_res, vehicle_start_hour)
-                for case_label, case_res in results_by_case.items()
-            },
+            "background_flow_by_case": background_flow_by_case,
             "setup": {
+                "T_hours": float(T_hours),
                 "n_main_cells": int(n_main_cells),
                 "diverge_idx": int(diverge_idx),
                 "merge_top_idx": int(merge_top_idx),
@@ -709,7 +996,6 @@ if run_clicked:
                 "incident_start_hour": float(incident_start_hour),
                 "incident_duration_hour": float(incident_duration_hour),
                 "blocked_lanes": int(blocked_lanes),
-                "vehicle_start_hour": float(vehicle_start_hour),
             },
         }
         st.success("4-case simulation completed.")
@@ -719,7 +1005,7 @@ sim_data = st.session_state.get("ctm_last_run")
 if sim_data is not None:
     results_by_case = sim_data["results_by_case"]
     incident_case_flags = sim_data["incident_case_flags"]
-    trajectories_by_case = sim_data["trajectories_by_case"]
+    background_flow_by_case = sim_data.get("background_flow_by_case", {})
     setup = sim_data["setup"]
 
     st.subheader("Network setup")
@@ -732,7 +1018,7 @@ if sim_data is not None:
         f"- Incident cell: {setup['incident_cell']}\n"
         f"- Incident start/duration: {format_hr_m(setup['incident_start_hour'])} / {format_hr_m(setup['incident_duration_hour'])}\n"
         f"- Blocked lanes at incident cell: {setup['blocked_lanes']}\n"
-        f"- Vehicle start time: {format_hr_m(setup['vehicle_start_hour'])}"
+        f"- Trajectory start time: set in Trajectory & Delay tab"
     )
 
     network_series_by_case = {
@@ -740,111 +1026,154 @@ if sim_data is not None:
         for label, res in results_by_case.items()
     }
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Density (2x2)",
-        "Speed (2x2)",
-        "Flow comparison",
-        "Speed/Density comparison",
-        "Trajectory & Delay",
-        "Q-k analysis",
+    top_tab1, top_tab2, top_tab3, top_tab4 = st.tabs([
+        "CTM Result",
+        "Scenario Comparison",
+        "Delay Analysis",
+        "q-k analysis",
     ])
 
-    with tab1:
-        density_vmax = max(float(np.max(res["density_main"])) for res in results_by_case.values())
-        fig_density_grid = make_case_heatmap_grid(
-            results_by_case,
-            key="density_main",
-            title="Mainline density heatmaps (4 cases, veh/km/lane)",
-            cmap="hot",
-            vmin=0.0,
-            vmax=density_vmax,
-            cbar_label="Density (veh/km/lane)",
-            incident_case_flags=incident_case_flags,
-            incident_start_hour=setup["incident_start_hour"],
-            incident_duration_hour=setup["incident_duration_hour"],
-            incident_cell=setup["incident_cell"],
-        )
-        st.pyplot(fig_density_grid)
+    with top_tab1:
+        ctm_tab1, ctm_tab2 = st.tabs([
+            "Density (2x2)",
+            "Speed (2x2)",
+        ])
 
-    with tab2:
-        fig_speed_grid = make_case_heatmap_grid(
-            results_by_case,
-            key="speed_main",
-            title="Mainline speed heatmaps (4 cases, km/hr)",
-            cmap="coolwarm",
-            vmin=0.0,
-            vmax=VF,
-            cbar_label="Speed (km/hr)",
-            incident_case_flags=incident_case_flags,
-            incident_start_hour=setup["incident_start_hour"],
-            incident_duration_hour=setup["incident_duration_hour"],
-            incident_cell=setup["incident_cell"],
-        )
-        st.pyplot(fig_speed_grid)
-
-    with tab3:
-        max_detector_cell = next(iter(results_by_case.values()))["flow_main_cell"].shape[1] - 1
-        middle_detector_cell_idx = st.slider(
-            "Middle detector cell index",
-            min_value=0,
-            max_value=max_detector_cell,
-            value=max_detector_cell // 2,
-            step=1,
-            key="middle_detector_cell_idx",
-        )
-        st.pyplot(make_detector_flow_by_scenario_grid(results_by_case, middle_detector_cell_idx=middle_detector_cell_idx))
-
-    with tab4:
-        fig_speed_ts = make_line_plot(
-            next(iter(results_by_case.values()))["time"],
-            {label: series["speed"] for label, series in network_series_by_case.items()},
-            "Vehicle speed comparison",
-            "Speed (km/hr)",
-        )
-        st.pyplot(fig_speed_ts)
-
-        fig_density_ts = make_line_plot(
-            next(iter(results_by_case.values()))["time"],
-            {label: series["density"] for label, series in network_series_by_case.items()},
-            "Network density comparison",
-            "Density (veh/km)",
-        )
-        st.pyplot(fig_density_ts)
-
-    with tab5:
-        st.pyplot(
-            make_trajectory_speed_background_grid(
+        with ctm_tab1:
+            density_vmax = max(float(np.max(res["density_main"])) for res in results_by_case.values())
+            fig_density_grid = make_case_heatmap_grid(
                 results_by_case,
-                trajectories_by_case,
-                setup["vehicle_start_hour"],
+                key="density_main",
+                title="Mainline density heatmaps (4 cases, veh/km/lane)",
+                cmap="hot",
+                vmin=0.0,
+                vmax=density_vmax,
+                cbar_label="Density (veh/km/lane)",
+                incident_case_flags=incident_case_flags,
+                incident_start_hour=setup["incident_start_hour"],
+                incident_duration_hour=setup["incident_duration_hour"],
+                incident_cell=setup["incident_cell"],
             )
-        )
+            st.pyplot(fig_density_grid)
 
-        delay_rows = []
-        for label, traj in trajectories_by_case.items():
-            delay_rows.append(
-                {
-                    "Scenario": label,
-                    "Start time": format_hr_m(setup["vehicle_start_hour"]),
-                    "Free-flow TT": format_hr_m(traj["free_flow_travel_time_hr"]),
-                    "Actual TT": format_hr_m(traj["actual_travel_time_hr"]),
-                    "Delay": format_hr_m(traj["delay_time_hr"]),
-                    "Arrival time": format_hr_m(traj["arrival_time_hr"]),
-                }
+        with ctm_tab2:
+            fig_speed_grid = make_case_heatmap_grid(
+                results_by_case,
+                key="speed_main",
+                title="Mainline speed heatmaps (4 cases, km/hr)",
+                cmap="coolwarm",
+                vmin=0.0,
+                vmax=VF,
+                cbar_label="Speed (km/hr)",
+                incident_case_flags=incident_case_flags,
+                incident_start_hour=setup["incident_start_hour"],
+                incident_duration_hour=setup["incident_duration_hour"],
+                incident_cell=setup["incident_cell"],
             )
-        st.dataframe(delay_rows, use_container_width=True)
+            st.pyplot(fig_speed_grid)
 
-    with tab6:
+    with top_tab2:
+        cmp_tab1, cmp_tab2 = st.tabs([
+            "Flow comparison",
+            "Speed/Density comparison",
+        ])
+
+        with cmp_tab1:
+            max_detector_cell = next(iter(results_by_case.values()))["flow_main_cell"].shape[1] - 1
+            middle_detector_cell_idx = st.slider(
+                "Middle detector cell index",
+                min_value=0,
+                max_value=max_detector_cell,
+                value=max_detector_cell // 2,
+                step=1,
+                key="middle_detector_cell_idx",
+            )
+            st.pyplot(make_detector_flow_by_scenario_grid(results_by_case, middle_detector_cell_idx=middle_detector_cell_idx))
+
+        with cmp_tab2:
+            fig_speed_ts = make_line_plot(
+                next(iter(results_by_case.values()))["time"],
+                {label: series["speed"] for label, series in network_series_by_case.items()},
+                "Average vehicle speed comparison",
+                "Speed (km/hr)",
+            )
+            st.pyplot(fig_speed_ts)
+
+            fig_density_ts = make_line_plot(
+                next(iter(results_by_case.values()))["time"],
+                {label: series["density"] for label, series in network_series_by_case.items()},
+                "Network density comparison",
+                "Density (veh/km)",
+            )
+            st.pyplot(fig_density_ts)
+
+    with top_tab3:
+        delay_tab1, delay_tab2 = st.tabs([
+            "Trajectory & Delay",
+            "3-lane segment delay",
+        ])
+
+        with delay_tab1:
+            vehicle_start_hour = st.slider(
+                "Vehicle start time from mainline origin",
+                min_value=0.0,
+                max_value=float(setup["T_hours"]),
+                value=min(1.0, float(setup["T_hours"])),
+                step=DT,
+                key="trajectory_start_hour_tab",
+            )
+            trajectories_by_case = {
+                case_label: compute_vehicle_trajectory(case_res, vehicle_start_hour)
+                for case_label, case_res in results_by_case.items()
+            }
+
+            st.pyplot(
+                make_trajectory_speed_background_grid(
+                    results_by_case,
+                    trajectories_by_case,
+                    vehicle_start_hour,
+                )
+            )
+
+            delay_rows = []
+            for label, traj in trajectories_by_case.items():
+                delay_rows.append(
+                    {
+                        "Scenario": label,
+                        "Start time": format_hr_m(vehicle_start_hour),
+                        "Free-flow TT": format_hr_m(traj["free_flow_travel_time_hr"]),
+                        "Actual TT": format_hr_m(traj["actual_travel_time_hr"]),
+                        "Delay": format_hr_m(traj["delay_time_hr"]),
+                        "Arrival time": format_hr_m(traj["arrival_time_hr"]),
+                    }
+                )
+            st.dataframe(delay_rows, width="stretch")
+
+        with delay_tab2:
+            st.image(str(BASE_DIR / "3-lane_image.png"), caption="3-lane segment detector layout", width="stretch")
+            st.pyplot(make_three_lane_cumulative_curve_grid(results_by_case, background_flow_by_case=background_flow_by_case))
+
+            seg_delay_rows = []
+            for label, res in results_by_case.items():
+                total_delay, n_up_total, n_down_total, n_unmatched = compute_three_lane_segment_total_delay_veh_hr(res)
+                seg_delay_rows.append(
+                    {
+                        "Scenario": label,
+                        "Total delay in 3-lane segment (veh-hr)": round(total_delay, 2),
+                    }
+                )
+            st.dataframe(seg_delay_rows, width="stretch")
+
+    with top_tab4:
         max_qk_step = next(iter(results_by_case.values()))["density_main"].shape[0] - 1
         if "qk_analysis_step" not in st.session_state:
             st.session_state["qk_analysis_step"] = max_qk_step
         st.session_state["qk_analysis_step"] = int(min(st.session_state["qk_analysis_step"], max_qk_step))
 
         qk_step_idx = st.slider(
-            "Q-k analysis timestep",
+            "q-k analysis timestep",
             min_value=0,
             max_value=max_qk_step,
-            value=int(st.session_state["qk_analysis_step"]),
             step=1,
             key="qk_analysis_step",
         )

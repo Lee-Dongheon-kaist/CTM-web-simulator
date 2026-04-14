@@ -384,6 +384,7 @@ def run_ctm(
         "time": time,
         "n_main": n_main,
         "n_on": n_on,
+        "f_main_link": f_main_link,
         "density_main": density_main,
         "density_on": density_on,
         "flow_main_cell": flow_main_cell,
