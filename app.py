@@ -4,6 +4,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
+from matplotlib.lines import Line2D
 
 BASE_DIR = Path(__file__).resolve().parent
 CTM_PATH = BASE_DIR / "code.py"
@@ -19,6 +20,9 @@ ALPHA = ctm_core.ALPHA
 QMAX_PER_LANE = ctm_core.QMAX_PER_LANE
 KJ_PER_LANE = ctm_core.KJ_PER_LANE
 W = ALPHA * VF
+QK_K_MAX = 4.5 * KJ_PER_LANE
+QK_Q_MAX = 4.5 * QMAX_PER_LANE
+QK_LAYOUT_RECT = [0.0, 0.03, 1.0, 0.96]
 N_MAIN_DEFAULT = ctm_core.N_MAIN
 DIVERGE_IDX_DEFAULT = ctm_core.DIVERGE_IDX
 MERGE_TOP_IDX_DEFAULT = ctm_core.MERGE_TOP_IDX
@@ -170,6 +174,59 @@ def make_line_plot(time, series_dict, title, ylabel):
     return fig
 
 
+def make_detector_flow_by_scenario_grid(results_by_case, middle_detector_cell_idx=None):
+    detector_specs = [
+        ("Main upstream", "inflow_main", "#9ecae1"),
+        ("Off-ramp", "outflow_off", "#fdd0a2"),
+        ("Upper on-ramp", "inflow_on_top", "#a1d99b"),
+        ("Lower on-ramp", "inflow_on_bottom", "#fcbba1"),
+        ("Main downstream", "outflow_main", "#cbc9e2"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    axes_flat = axes.ravel()
+    time = next(iter(results_by_case.values()))["time"]
+    n_cells = next(iter(results_by_case.values()))["flow_main_cell"].shape[1]
+    if middle_detector_cell_idx is None:
+        middle_detector_cell_idx = n_cells // 2
+    middle_detector_cell_idx = int(max(0, min(n_cells - 1, middle_detector_cell_idx)))
+
+    for ax, (scenario_label, res) in zip(axes_flat, results_by_case.items()):
+        for detector_label, detector_key, color in detector_specs:
+            ax.plot(time, res[detector_key], label=detector_label, color=color, linewidth=1.6, alpha=0.55)
+
+        # Configurable middle detector from mainline cell flow.
+        ax.plot(
+            time,
+            res["flow_main_cell"][:, middle_detector_cell_idx],
+            label=f"Main middle (cell {middle_detector_cell_idx})",
+            color="#d60000",
+            linewidth=2.6,
+            alpha=0.95,
+        )
+
+        ax.set_title(scenario_label)
+        ax.set_xlabel("Time (hr)")
+        ax.set_ylabel("Flow (veh/hr)")
+        ax.set_ylim(0.0, 8000.0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+    fig.suptitle("Detector flow comparison by scenario")
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
+    return fig
+
+
+def format_hr_m(hours):
+    if hours is None:
+        return "-"
+    total_minutes = int(round(float(hours) * 60.0))
+    sign = "-" if total_minutes < 0 else ""
+    total_minutes = abs(total_minutes)
+    hh, mm = divmod(total_minutes, 60)
+    return f"{sign}{hh} hr {mm} min"
+
+
 def compute_network_weighted_series(res):
     n_main = res["n_main"][:-1]
     speed_main = res["speed_main"]
@@ -210,15 +267,127 @@ def make_network_qk_grid(network_series_by_case):
         ax.set_title(label)
         ax.set_xlabel("Network density k (veh/km)")
         ax.set_ylabel("Network flow q (veh/hr)")
-        ax.set_xlim(0.0, 4.0 * KJ_PER_LANE)
-        ax.set_ylim(0.0, 4.0 * QMAX_PER_LANE)
+        ax.set_xlim(0.0, QK_K_MAX)
+        ax.set_ylim(0.0, QK_Q_MAX)
         ax.grid(True, alpha=0.25)
 
-        cbar = fig.colorbar(sc, ax=ax)
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
         cbar.set_label("Time (hr)")
 
     fig.suptitle("Network-level q-k diagram by timestep (4 scenarios)")
-    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
+    fig.tight_layout(rect=QK_LAYOUT_RECT)
+    return fig
+
+
+def make_cell_qk_last_grid(results_by_case, analysis_step_idx=None, analysis_time_hr=None):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    axes_flat = axes.ravel()
+
+    k_lane = np.linspace(0.0, KJ_PER_LANE, 400)
+    q_lane = np.minimum(np.minimum(VF * k_lane, QMAX_PER_LANE), W * (KJ_PER_LANE - k_lane))
+    k_fd_3 = 3.0 * k_lane
+    q_fd_3 = 3.0 * q_lane
+    k_fd_4 = 4.0 * k_lane
+    q_fd_4 = 4.0 * q_lane
+
+    for idx, (ax, (label, res)) in enumerate(zip(axes_flat, results_by_case.items())):
+        step_idx = -1 if analysis_step_idx is None else int(np.clip(analysis_step_idx, 0, res["density_main"].shape[0] - 1))
+        lanes = res["main_lanes_by_cell"]
+        k_cell_last = res["density_main"][step_idx] * lanes
+        q_cell_last = res["flow_main_cell"][step_idx]
+        k_mean = float(np.mean(k_cell_last))
+        q_mean = float(np.mean(q_cell_last))
+
+        ax.plot(k_fd_3, q_fd_3, linestyle="--", color="#4a90e2", linewidth=1.4, label="FD x3")
+        ax.plot(k_fd_4, q_fd_4, linestyle="--", color="#0057b8", linewidth=1.6, label="FD x4")
+        ax.scatter(k_cell_last, q_cell_last, s=30, color="#2d3748", alpha=0.9)
+        ax.annotate(
+            "",
+            xy=(k_mean, q_mean),
+            xytext=(0.0, 0.0),
+            arrowprops=dict(arrowstyle="->", color="red", lw=2.0),
+        )
+        ax.scatter(k_mean, q_mean, s=70, color="red", marker="o", zorder=5, label="Mean vector")
+        ax.text(k_mean, q_mean, " mean", color="red", fontsize=8, fontweight="bold")
+
+        ax.set_title(label)
+        ax.set_xlabel("Cell density k (veh/km)")
+        ax.set_ylabel("Cell flow q (veh/hr)")
+        ax.set_xlim(0.0, QK_K_MAX)
+        ax.set_ylim(0.0, QK_Q_MAX)
+        ax.grid(True, alpha=0.25)
+
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles, labels, loc="upper right", fontsize=8, framealpha=0.9)
+
+    if analysis_time_hr is None:
+        fig.suptitle("Cell-level q-k at selected timestep (with FD x3/x4 background)")
+    else:
+        fig.suptitle(f"Cell-level q-k at selected timestep (t={format_hr_m(analysis_time_hr)}, with FD x3/x4 background)")
+    fig.tight_layout(rect=QK_LAYOUT_RECT)
+    return fig
+
+
+def make_qk_overlay_comparison_grid(network_series_by_case, results_by_case, analysis_step_idx=None, analysis_time_hr=None):
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True, sharey=True)
+    axes_flat = axes.ravel()
+
+    for ax, (label, res) in zip(axes_flat, results_by_case.items()):
+        series = network_series_by_case[label]
+        k_net = series["density"]
+        q_net = series["flow"]
+        t_net = series["time"]
+
+        step_idx = len(k_net) - 1 if analysis_step_idx is None else int(np.clip(analysis_step_idx, 0, len(k_net) - 1))
+        lanes = res["main_lanes_by_cell"]
+        k_cell_last = res["density_main"][step_idx] * lanes
+        q_cell_last = res["flow_main_cell"][step_idx]
+        k_mean = float(np.mean(k_cell_last))
+        q_mean = float(np.mean(q_cell_last))
+
+        sc = ax.scatter(k_net, q_net, c=t_net, cmap="viridis", s=18, alpha=0.85, label="Network q-k points")
+        ax.scatter(
+            [k_net[step_idx]],
+            [q_net[step_idx]],
+            s=110,
+            facecolors="none",
+            edgecolors="#f59e0b",
+            linewidths=2.2,
+            zorder=6,
+            label="Selected timestep",
+        )
+        ax.annotate(
+            "",
+            xy=(k_mean, q_mean),
+            xytext=(0.0, 0.0),
+            arrowprops=dict(arrowstyle="->", color="red", lw=2.0),
+        )
+        ax.set_title(label)
+        ax.set_xlabel("k (veh/km)")
+        ax.set_ylabel("q (veh/hr)")
+        ax.set_xlim(0.0, QK_K_MAX)
+        ax.set_ylim(0.0, QK_Q_MAX)
+        ax.grid(True, alpha=0.25)
+
+        handles, labels = ax.get_legend_handles_labels()
+        uniq = dict(zip(labels, handles))
+        uniq["Red arrow: origin -> mean cell q-k"] = Line2D([0], [0], color="red", lw=2.0)
+        ax.legend(
+            uniq.values(),
+            uniq.keys(),
+            loc="upper right",
+            fontsize=8,
+            framealpha=0.9,
+        )
+
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02)
+        cbar.set_label("Time (hr)")
+
+    if analysis_time_hr is None:
+        fig.suptitle("Overlay: network q-k points and cell q-k mean vector")
+    else:
+        fig.suptitle(f"Overlay: network q-k points and cell q-k mean vector (t={format_hr_m(analysis_time_hr)})")
+    fig.tight_layout(rect=QK_LAYOUT_RECT)
     return fig
 
 
@@ -465,7 +634,10 @@ layout_left, layout_right = st.columns([2.4, 1.0])
 with layout_left:
     st.subheader("Initial Network")
     st.pyplot(make_network_image_with_incident(str(BASE_DIR / "Network_image.png"), n_main_cells, incident_cell))
-    st.caption(f"Incident marker: cell {incident_cell}, from {incident_start_hour:.2f} hr to {incident_start_hour + incident_duration_hour:.2f} hr")
+    st.caption(
+        f"Incident marker: cell {incident_cell}, from {format_hr_m(incident_start_hour)} "
+        f"to {format_hr_m(incident_start_hour + incident_duration_hour)}"
+    )
 
 with layout_right:
     st.subheader("Fundamental Diagram")
@@ -521,128 +693,188 @@ if run_clicked:
     except Exception as e:
         st.error(f"Simulation error: {e}")
     else:
+        st.session_state["ctm_last_run"] = {
+            "results_by_case": results_by_case,
+            "incident_case_flags": incident_case_flags,
+            "trajectories_by_case": {
+                case_label: compute_vehicle_trajectory(case_res, vehicle_start_hour)
+                for case_label, case_res in results_by_case.items()
+            },
+            "setup": {
+                "n_main_cells": int(n_main_cells),
+                "diverge_idx": int(diverge_idx),
+                "merge_top_idx": int(merge_top_idx),
+                "merge_bottom_idx": int(merge_bottom_idx),
+                "incident_cell": int(incident_cell),
+                "incident_start_hour": float(incident_start_hour),
+                "incident_duration_hour": float(incident_duration_hour),
+                "blocked_lanes": int(blocked_lanes),
+                "vehicle_start_hour": float(vehicle_start_hour),
+            },
+        }
         st.success("4-case simulation completed.")
 
-        trajectories_by_case = {
-            case_label: compute_vehicle_trajectory(case_res, vehicle_start_hour)
-            for case_label, case_res in results_by_case.items()
-        }
+sim_data = st.session_state.get("ctm_last_run")
 
-        st.subheader("Network setup")
-        st.write(
-            f"- Mainline cells: {n_main_cells}\n"
-            f"- Ramp cells: simplified (no ramp cell state)\n"
-            f"- Off-ramp diverge index: {diverge_idx}\n"
-            f"- Upper on-ramp merge index: {merge_top_idx}\n"
-            f"- Lower on-ramp merge index: {merge_bottom_idx}\n"
-            f"- Incident cell: {incident_cell}\n"
-            f"- Incident start/duration: {incident_start_hour:.2f} h / {incident_duration_hour:.2f} h\n"
-            f"- Blocked lanes at incident cell: {blocked_lanes}\n"
-            f"- Vehicle start time: {vehicle_start_hour:.2f} h"
+if sim_data is not None:
+    results_by_case = sim_data["results_by_case"]
+    incident_case_flags = sim_data["incident_case_flags"]
+    trajectories_by_case = sim_data["trajectories_by_case"]
+    setup = sim_data["setup"]
+
+    st.subheader("Network setup")
+    st.write(
+        f"- Mainline cells: {setup['n_main_cells']}\n"
+        f"- Ramp cells: simplified (no ramp cell state)\n"
+        f"- Off-ramp diverge index: {setup['diverge_idx']}\n"
+        f"- Upper on-ramp merge index: {setup['merge_top_idx']}\n"
+        f"- Lower on-ramp merge index: {setup['merge_bottom_idx']}\n"
+        f"- Incident cell: {setup['incident_cell']}\n"
+        f"- Incident start/duration: {format_hr_m(setup['incident_start_hour'])} / {format_hr_m(setup['incident_duration_hour'])}\n"
+        f"- Blocked lanes at incident cell: {setup['blocked_lanes']}\n"
+        f"- Vehicle start time: {format_hr_m(setup['vehicle_start_hour'])}"
+    )
+
+    network_series_by_case = {
+        label: compute_network_weighted_series(res)
+        for label, res in results_by_case.items()
+    }
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "Density (2x2)",
+        "Speed (2x2)",
+        "Flow comparison",
+        "Speed/Density comparison",
+        "Trajectory & Delay",
+        "Q-k analysis",
+    ])
+
+    with tab1:
+        density_vmax = max(float(np.max(res["density_main"])) for res in results_by_case.values())
+        fig_density_grid = make_case_heatmap_grid(
+            results_by_case,
+            key="density_main",
+            title="Mainline density heatmaps (4 cases, veh/km/lane)",
+            cmap="hot",
+            vmin=0.0,
+            vmax=density_vmax,
+            cbar_label="Density (veh/km/lane)",
+            incident_case_flags=incident_case_flags,
+            incident_start_hour=setup["incident_start_hour"],
+            incident_duration_hour=setup["incident_duration_hour"],
+            incident_cell=setup["incident_cell"],
+        )
+        st.pyplot(fig_density_grid)
+
+    with tab2:
+        fig_speed_grid = make_case_heatmap_grid(
+            results_by_case,
+            key="speed_main",
+            title="Mainline speed heatmaps (4 cases, km/hr)",
+            cmap="coolwarm",
+            vmin=0.0,
+            vmax=VF,
+            cbar_label="Speed (km/hr)",
+            incident_case_flags=incident_case_flags,
+            incident_start_hour=setup["incident_start_hour"],
+            incident_duration_hour=setup["incident_duration_hour"],
+            incident_cell=setup["incident_cell"],
+        )
+        st.pyplot(fig_speed_grid)
+
+    with tab3:
+        max_detector_cell = next(iter(results_by_case.values()))["flow_main_cell"].shape[1] - 1
+        middle_detector_cell_idx = st.slider(
+            "Middle detector cell index",
+            min_value=0,
+            max_value=max_detector_cell,
+            value=max_detector_cell // 2,
+            step=1,
+            key="middle_detector_cell_idx",
+        )
+        st.pyplot(make_detector_flow_by_scenario_grid(results_by_case, middle_detector_cell_idx=middle_detector_cell_idx))
+
+    with tab4:
+        fig_speed_ts = make_line_plot(
+            next(iter(results_by_case.values()))["time"],
+            {label: series["speed"] for label, series in network_series_by_case.items()},
+            "Vehicle speed comparison",
+            "Speed (km/hr)",
+        )
+        st.pyplot(fig_speed_ts)
+
+        fig_density_ts = make_line_plot(
+            next(iter(results_by_case.values()))["time"],
+            {label: series["density"] for label, series in network_series_by_case.items()},
+            "Network density comparison",
+            "Density (veh/km)",
+        )
+        st.pyplot(fig_density_ts)
+
+    with tab5:
+        st.pyplot(
+            make_trajectory_speed_background_grid(
+                results_by_case,
+                trajectories_by_case,
+                setup["vehicle_start_hour"],
+            )
         )
 
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-            "Density (2x2)",
-            "Speed (2x2)",
-            "Flow comparison",
-            "Speed/Density comparison",
-            "Trajectory & Delay",
-            "Network q-k diagram",
-        ])
-
-        with tab1:
-            density_vmax = max(float(np.max(res["density_main"])) for res in results_by_case.values())
-            fig_density_grid = make_case_heatmap_grid(
-                results_by_case,
-                key="density_main",
-                title="Mainline density heatmaps (4 cases, veh/km/lane)",
-                cmap="hot",
-                vmin=0.0,
-                vmax=density_vmax,
-                cbar_label="Density (veh/km/lane)",
-                incident_case_flags=incident_case_flags,
-                incident_start_hour=incident_start_hour,
-                incident_duration_hour=incident_duration_hour,
-                incident_cell=incident_cell,
-            )
-            st.pyplot(fig_density_grid)
-
-        with tab2:
-            fig_speed_grid = make_case_heatmap_grid(
-                results_by_case,
-                key="speed_main",
-                title="Mainline speed heatmaps (4 cases, km/hr)",
-                cmap="coolwarm",
-                vmin=0.0,
-                vmax=VF,
-                cbar_label="Speed (km/hr)",
-                incident_case_flags=incident_case_flags,
-                incident_start_hour=incident_start_hour,
-                incident_duration_hour=incident_duration_hour,
-                incident_cell=incident_cell,
-            )
-            st.pyplot(fig_speed_grid)
-
-        with tab3:
-            fig_flow = make_line_plot(
-                next(iter(results_by_case.values()))["time"],
+        delay_rows = []
+        for label, traj in trajectories_by_case.items():
+            delay_rows.append(
                 {
-                    "Off-peak / No incident": results_by_case["Off-peak / No incident"]["outflow_main"],
-                    "Off-peak / Incident": results_by_case["Off-peak / Incident"]["outflow_main"],
-                    "Peak / No incident": results_by_case["Peak / No incident"]["outflow_main"],
-                    "Peak / Incident": results_by_case["Peak / Incident"]["outflow_main"],
-                },
-                "Main downstream outflow comparison",
-                "Outflow (veh/hr)",
+                    "Scenario": label,
+                    "Start time": format_hr_m(setup["vehicle_start_hour"]),
+                    "Free-flow TT": format_hr_m(traj["free_flow_travel_time_hr"]),
+                    "Actual TT": format_hr_m(traj["actual_travel_time_hr"]),
+                    "Delay": format_hr_m(traj["delay_time_hr"]),
+                    "Arrival time": format_hr_m(traj["arrival_time_hr"]),
+                }
             )
-            st.pyplot(fig_flow)
+        st.dataframe(delay_rows, use_container_width=True)
 
-        with tab4:
-            network_series_by_case = {
-                label: compute_network_weighted_series(res)
-                for label, res in results_by_case.items()
-            }
+    with tab6:
+        max_qk_step = next(iter(results_by_case.values()))["density_main"].shape[0] - 1
+        if "qk_analysis_step" not in st.session_state:
+            st.session_state["qk_analysis_step"] = max_qk_step
+        st.session_state["qk_analysis_step"] = int(min(st.session_state["qk_analysis_step"], max_qk_step))
 
-            fig_speed_ts = make_line_plot(
-                next(iter(results_by_case.values()))["time"],
-                {label: series["speed"] for label, series in network_series_by_case.items()},
-                "Vehicle-weighted network speed comparison",
-                "Speed (km/hr)",
-            )
-            st.pyplot(fig_speed_ts)
+        qk_step_idx = st.slider(
+            "Q-k analysis timestep",
+            min_value=0,
+            max_value=max_qk_step,
+            value=int(st.session_state["qk_analysis_step"]),
+            step=1,
+            key="qk_analysis_step",
+        )
+        time_ref = next(iter(results_by_case.values()))["time"]
+        sim_end_hr = float(len(time_ref) * DT)
+        qk_time_hr = float(min(sim_end_hr, float(time_ref[qk_step_idx] + DT)))
+        st.caption(f"Selected timestep: {qk_step_idx} (t = {format_hr_m(qk_time_hr)})")
 
-            fig_density_ts = make_line_plot(
-                next(iter(results_by_case.values()))["time"],
-                {label: series["density"] for label, series in network_series_by_case.items()},
-                "Network density comparison (total vehicles / network length)",
-                "Density (veh/km)",
-            )
-            st.pyplot(fig_density_ts)
-
-        with tab5:
-            st.pyplot(make_trajectory_speed_background_grid(results_by_case, trajectories_by_case, vehicle_start_hour))
-
-            delay_rows = []
-            for label, traj in trajectories_by_case.items():
-                delay_rows.append(
-                    {
-                        "Scenario": label,
-                        "Start time (hr)": vehicle_start_hour,
-                        "Free-flow TT (hr)": traj["free_flow_travel_time_hr"],
-                        "Actual TT (hr)": traj["actual_travel_time_hr"],
-                        "Delay (hr)": traj["delay_time_hr"],
-                        "Arrival time (hr)": traj["arrival_time_hr"],
-                    }
-                )
-            st.dataframe(delay_rows, use_container_width=True)
-
-        with tab6:
+        qk_tab1, qk_tab2, qk_tab3 = st.tabs([
+            "Network q-k diagram",
+            "Cell q-k at selected timestep",
+            "Overlay q-k comparison",
+        ])
+        with qk_tab1:
             st.pyplot(make_network_qk_grid(network_series_by_case))
+        with qk_tab2:
+            st.pyplot(make_cell_qk_last_grid(results_by_case, analysis_step_idx=qk_step_idx, analysis_time_hr=qk_time_hr))
+        with qk_tab3:
+            st.pyplot(
+                make_qk_overlay_comparison_grid(
+                    network_series_by_case,
+                    results_by_case,
+                    analysis_step_idx=qk_step_idx,
+                    analysis_time_hr=qk_time_hr,
+                )
+            )
 
-        with st.expander("Simulation arrays preview (Peak / Incident)"):
-            preview = results_by_case["Peak / Incident"]
-            st.write("density_main shape:", preview["density_main"].shape)
-            st.dataframe(preview["density_main"][: min(10, preview["density_main"].shape[0]), :])
-
+    with st.expander("Simulation arrays preview (Peak / Incident)"):
+        preview = results_by_case["Peak / Incident"]
+        st.write("density_main shape:", preview["density_main"].shape)
+        st.dataframe(preview["density_main"][: min(10, preview["density_main"].shape[0]), :])
 else:
     st.info("Adjust parameters in the input panel and click Run 4-case comparison.")
